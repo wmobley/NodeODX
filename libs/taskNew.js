@@ -49,6 +49,77 @@ const removeDirectory = function(dir, cb = () => {}){
     });
 };
 
+const getImportPathField = (body = {}) => {
+    if (!body) return null;
+    return body.import_path || body.importPath || null;
+};
+
+const isWithinRoot = (candidate, root) => {
+    const normalizedRoot = path.resolve(root);
+    const normalizedCandidate = path.resolve(candidate);
+    return normalizedCandidate === normalizedRoot ||
+        normalizedCandidate.indexOf(`${normalizedRoot}${path.sep}`) === 0;
+};
+
+const normalizeImportPath = (rawPath) => {
+    if (!rawPath) return { path: null };
+    const trimmed = String(rawPath).trim();
+    if (!trimmed) return { error: 'import_path cannot be empty.' };
+    if (!config.importPathRoots || config.importPathRoots.length === 0){
+        return { error: 'Shared-path processing is disabled on this node.' };
+    }
+
+    let resolved;
+    try {
+        resolved = fs.realpathSync(path.resolve(trimmed));
+    } catch (err) {
+        return { error: `Import path ${trimmed} cannot be accessed (${err.message}).` };
+    }
+
+    const allowed = config.importPathRoots.some(root => {
+        let canonicalRoot;
+        try {
+            canonicalRoot = fs.realpathSync(root);
+        } catch (err) {
+            canonicalRoot = path.resolve(root);
+        }
+        return isWithinRoot(resolved, canonicalRoot);
+    });
+
+    if (!allowed) return { error: `Import path ${resolved} is outside the configured shared roots.` };
+
+    try {
+        if (!fs.statSync(resolved).isDirectory()) {
+            return { error: `Import path ${resolved} must be a directory.` };
+        }
+    } catch (err) {
+        return { error: `Import path ${resolved} cannot be accessed (${err.message}).` };
+    }
+
+    return { path: resolved };
+};
+
+const copyImportSupportFiles = (srcDir, dstDir, cb) => {
+    fs.readdir(srcDir, (err, entries) => {
+        if (err) return cb(err);
+        async.eachSeries(entries, (entry, done) => {
+            if (!/\.txt$/i.test(entry) && !/^align\.(las|laz|tif)$/i.test(entry)) return done();
+            fs.copyFile(path.join(srcDir, entry), path.join(dstDir, entry), copyErr => {
+                if (copyErr && copyErr.code !== 'EEXIST') return done(copyErr);
+                done();
+            });
+        }, cb);
+    });
+};
+
+const estimateImportImages = (dir, cb) => {
+    fs.readdir(dir, (err, entries) => {
+        if (err) return cb(err, 0);
+        const imageCount = entries.filter(entry => /\.(jpe?g|png|gif|bmp|tiff?)$/i.test(entry)).length;
+        cb(null, imageCount);
+    });
+};
+
 const assureUniqueFilename = (dstPath, filename, cb) => {
     const dstFile = path.join(dstPath, filename);
     fs.exists(dstFile, exists => {
@@ -176,8 +247,9 @@ module.exports = {
                 req.body = body;
                 req.files = files;
 
-                if (req.files.length === 0){
-                    req.error = "Need at least 1 file.";
+                const hasImportPath = !!getImportPathField(req.body);
+                if (req.files.length === 0 && !hasImportPath && !req.body.zipurl){
+                    req.error = "Need at least 1 file, a zip file url, or an import_path.";
                 }
                 next();
             }
@@ -226,12 +298,33 @@ module.exports = {
 
     createTask: (req, res) => {
         const srcPath = path.join("tmp", req.id);
+        const rawImportPath = getImportPathField(req.body);
+        const hasUploadedFiles = Array.isArray(req.files) && req.files.length > 0;
+        const hasZipUrl = !!req.body.zipurl;
 
         // Print error message and cleanup
         const die = (error) => {
             res.json({error});
             removeDirectory(srcPath);
         };
+
+        let sharedImportPath = null;
+        let useSharedImport = false;
+        if (rawImportPath){
+            const result = normalizeImportPath(rawImportPath);
+            if (result.error){
+                if (hasUploadedFiles || hasZipUrl){
+                    logger.warn(`Import path ${rawImportPath} rejected (${result.error}); falling back to uploaded data for task ${req.id}`);
+                }else{
+                    die(result.error);
+                    return;
+                }
+            }else{
+                sharedImportPath = result.path;
+                useSharedImport = true;
+                logger.info(`Using shared import_path ${sharedImportPath} for task ${req.id}`);
+            }
+        }
         
         let destPath = path.join(Directories.data, req.id);
         let destImagesPath = path.join(destPath, "images");
@@ -248,7 +341,40 @@ module.exports = {
             }
         };
 
-        let initSteps = [
+        let initSteps;
+        if (useSharedImport){
+            initSteps = [
+                cb => {
+                    fs.stat(destPath, err => {
+                        if (err && err.code === 'ENOENT') return cb();
+                        if (err) return cb(err);
+                        removeDirectory(destPath, removeErr => {
+                            if (removeErr) cb(new Error(`Directory exists and we couldn't remove it.`));
+                            else cb();
+                        });
+                    });
+                },
+                cb => fs.mkdir(destPath, undefined, err => cb(err && err.code !== 'EEXIST' ? err : null)),
+                cb => fs.mkdir(destGcpPath, undefined, err => cb(err && err.code !== 'EEXIST' ? err : null)),
+                cb => fs.symlink(sharedImportPath, destImagesPath, 'dir', err => {
+                    if (err) logger.error(`Cannot link shared import_path ${sharedImportPath}: ${err.message}`);
+                    cb(err);
+                }),
+                cb => {
+                    fs.stat(destImagesPath, (err, stats) => {
+                        if (err) return cb(err);
+                        if (!stats.isDirectory()) return cb(new Error(`import_path ${sharedImportPath} is not a directory.`));
+                        cb();
+                    });
+                },
+                cb => checkMaxImageLimits(cb),
+                cb => copyImportSupportFiles(sharedImportPath, destGcpPath, err => {
+                    if (err && err.code !== 'ENOENT') return cb(err);
+                    cb();
+                })
+            ];
+        }else{
+            initSteps = [
             // Check if dest directory already exists
             cb => {
                 if (req.files && req.files.length > 0) {
@@ -381,7 +507,8 @@ module.exports = {
                     }
                 });
             }
-        ];
+            ];
+        }
 
         if (req.error !== undefined){
             die(req.error);
@@ -391,10 +518,11 @@ module.exports = {
             async.series([
                 cb => {
                     // Basic path check
-                    fs.exists(srcPath, exists => {
-                        if (exists) cb();
-                        else cb(new Error(`Invalid UUID`));
-                    });
+                    if (useSharedImport) cb();
+                    else fs.exists(srcPath, exists => {
+                            if (exists) cb();
+                            else cb(new Error(`Invalid UUID`));
+                        });
                 },
                 cb => {
                     odmInfo.filterOptions(req.body.options, (err, options) => {
@@ -406,10 +534,17 @@ module.exports = {
                     });
                 },
                 cb => {
-                    fs.readdir(srcPath, (err, entries) => {
-                        if (!err) imagesCountEstimate = entries.length;
-                        cb();
-                    });
+                    if (useSharedImport){
+                        estimateImportImages(sharedImportPath, (err, count) => {
+                            if (!err) imagesCountEstimate = count;
+                            cb();
+                        });
+                    }else{
+                        fs.readdir(srcPath, (err, entries) => {
+                            if (!err) imagesCountEstimate = entries.length;
+                            cb();
+                        });
+                    }
                 },
                 cb => {
                     const task = new Task(req.id, req.body.name, req.body.options,

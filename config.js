@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 'use strict';
 
 let fs = require('fs');
+let path = require('path');
 let argv = require('minimist')(process.argv.slice(2));
 let utils = require('./libs/utils');
 let apps = require('./libs/apps');
@@ -144,6 +145,26 @@ config.s3UploadEverything = argv.s3_upload_everything || fromConfigFile("s3Uploa
 config.s3IgnoreSSL = argv.s3_ignore_ssl || fromConfigFile("s3IgnoreSSL", false);
 config.maxConcurrency = parseInt(argv.max_concurrency || fromConfigFile("maxConcurrency", 0));
 config.maxRuntime = parseInt(argv.max_runtime || fromConfigFile("maxRuntime", -1));
+
+// Shared-filesystem task inputs are opt-in and must be constrained to explicit
+// roots. NODEODM_IMPORT_PATH_ROOTS is accepted for compatibility with the
+// existing LS6 deployment while NODEODX_IMPORT_PATH_ROOTS is the preferred name.
+const importPathRoots = fromConfigFile("importPathRoots", []);
+const envImportRoots = (process.env.NODEODX_IMPORT_PATH_ROOTS ||
+    process.env.NODEODM_IMPORT_PATH_ROOTS || '')
+    .split(path.delimiter)
+    .map(root => root.trim())
+    .filter(Boolean);
+const tapisJobRoot = process.env._tapisJobWorkingDir ? [process.env._tapisJobWorkingDir] : [];
+
+const combinedImportRoots = [].concat(importPathRoots, envImportRoots, tapisJobRoot);
+config.importPathRoots = combinedImportRoots.map(root => {
+    try {
+        return fs.realpathSync(path.resolve(root));
+    } catch (err) {
+        return path.resolve(root);
+    }
+}).filter((root, index, roots) => roots.indexOf(root) === index);
 
 // Detect 7z availability
 config.has7z = spawnSync(apps.sevenZ, ['--help']).status === 0;

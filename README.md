@@ -110,6 +110,26 @@ docker run -p 3000:3000 -v /mnt/external_hd:/var/www/data webodm/nodeodx
 
 This can be also used to access the computation results directly from the file system.
 
+## Processing Tasks From Shared Storage
+
+NodeODX can process an existing shared-filesystem image directory without uploading the images over HTTP. Configure one or more allowed roots with `importPathRoots` in the configuration file, or with `NODEODX_IMPORT_PATH_ROOTS` (colon-separated on Linux). `NODEODM_IMPORT_PATH_ROOTS` is also accepted for compatibility with existing LS6 deployments.
+
+```json
+{
+  "importPathRoots": ["/scratch/06659/wmobley/tapis"]
+}
+```
+
+Submit a task with an `import_path` form field containing a directory under an allowed root:
+
+```bash
+curl -X POST http://localhost:3000/task/new \
+  -F 'import_path=/scratch/06659/wmobley/tapis/<job>/images' \
+  -F 'options=[{"name":"no-gpu","value":true}]'
+```
+
+NodeODX resolves and validates the path, creates a symlink from the task's `data/<uuid>/images` directory to the shared directory, and leaves the source images untouched. Task outputs and generated archives remain under the NodeODX task directory. Paths outside the configured roots, missing paths, and non-directory paths are rejected when no upload or URL fallback is supplied.
+
 ## Using GPU Acceleration
 
 Since ODX has support [for GPU acceleration](https://github.com/https://github.com/WebODM/ODX#gpu-acceleration) you can use another base image for GPU processing. You need to use the `webodm/nodeodx:gpu` docker image instead of `webodm/nodeodx` and you need to pass the `--gpus all` flag:
@@ -240,4 +260,3 @@ NodeODX is meant to be a lightweight API. If you are looking for a more comprehe
 ## Contributing
 
 Make a pull request for small contributions. For big contributions, please open a discussion first. Please use ES6 syntax while writing new Javascript code so that we can keep the code base uniform.
-

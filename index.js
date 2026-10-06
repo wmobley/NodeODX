@@ -220,6 +220,12 @@ app.post('/task/new/commit/:uuid', authCheck, taskNew.getUUID, taskNew.handleCom
  *          required: false
  *          type: string
  *        -
+ *          name: import_path
+ *          in: formData
+ *          description: Existing shared-filesystem directory containing images. The path must be under a configured importPathRoots entry; files are processed in place without HTTP upload.
+ *          required: false
+ *          type: string
+ *        -
  *          name: name
  *          in: formData
  *          description: An optional name to be associated with the task
@@ -284,7 +290,8 @@ app.post('/task/new/commit/:uuid', authCheck, taskNew.getUUID, taskNew.handleCom
  */
 app.post('/task/new', authCheck, taskNew.assignUUID, taskNew.uploadImages, (req, res, next) => {
     req.body = req.body || {};
-    if ((!req.files || req.files.length === 0) && !req.body.zipurl) req.error = "Need at least 1 file or a zip file url.";
+    const hasImportPath = !!(req.body.import_path || req.body.importPath);
+    if ((!req.files || req.files.length === 0) && !req.body.zipurl && !hasImportPath) req.error = "Need at least 1 file, a zip file url, or an import_path.";
     else if (config.maxImages && req.files && req.files.length > config.maxImages) req.error = `${req.files.length} images uploaded, but this node can only process up to ${config.maxImages}.`;
     else if ((!req.files || req.files.length === 0) && req.body.zipurl) {
         const srcPath = path.join("tmp", req.id);
